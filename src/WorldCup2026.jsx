@@ -1,27 +1,19 @@
-import React, { useState, useEffect, useCallback, useMemo } from "react";
+import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { GROUPS, TEAM_INFO } from "./teams-data.js";
+import { KNOCKOUT_MATCHES, KO_ROUND_ORDER } from "./knockout-data.js";
+import { fetchRemoteResults } from "./remote-data.js";
 
 /* ---------------------------------------------------------------------- */
-/* DADOS DO TORNEIO                                                       */
+/* CONSTANTES                                                             */
 /* ---------------------------------------------------------------------- */
-
-const GROUPS = {
-  A: ["México", "África do Sul", "Coreia do Sul", "Rep. Checa"],
-  B: ["Canadá", "Bósnia e Herz.", "Catar", "Suíça"],
-  C: ["Brasil", "Marrocos", "Haiti", "Escócia"],
-  D: ["Estados Unidos", "Turquia", "Austrália", "Paraguai"],
-  E: ["Alemanha", "Curaçau", "Costa do Marfim", "Equador"],
-  F: ["Holanda", "Japão", "Suécia", "Tunísia"],
-  G: ["Bélgica", "Egito", "Irã", "Nova Zelândia"],
-  H: ["Espanha", "Cabo Verde", "Arábia Saudita", "Uruguai"],
-  I: ["França", "Senegal", "Iraque", "Noruega"],
-  J: ["Argentina", "Argélia", "Áustria", "Jordânia"],
-  K: ["Portugal", "RD Congo", "Uzbequistão", "Colômbia"],
-  L: ["Inglaterra", "Croácia", "Gana", "Panamá"],
-};
 
 const GROUP_LETTERS = Object.keys(GROUPS);
 const LEFT_GROUPS = ["A", "B", "C", "D", "E", "F"];
 const RIGHT_GROUPS = ["G", "H", "I", "J", "K", "L"];
+
+const STORAGE_KEY = "wc2026-resultados-v2";
+const REMOTE_CACHE_KEY = "wc2026-remote-cache-v2";
+const REMOTE_REFRESH_MS = 5 * 60 * 1000; // 5 minutos
 
 function groupFixtures(letter) {
   const t = GROUPS[letter];
@@ -35,37 +27,11 @@ function groupFixtures(letter) {
   ];
 }
 
-const R32_MATCHES = [
-  { id: "R32-01", home: { type: "first", group: "A" }, away: { type: "third", slot: 0 } },
-  { id: "R32-02", home: { type: "first", group: "C" }, away: { type: "third", slot: 1 } },
-  { id: "R32-03", home: { type: "first", group: "E" }, away: { type: "third", slot: 2 } },
-  { id: "R32-04", home: { type: "first", group: "G" }, away: { type: "third", slot: 3 } },
-  { id: "R32-05", home: { type: "first", group: "H" }, away: { type: "third", slot: 4 } },
-  { id: "R32-06", home: { type: "first", group: "I" }, away: { type: "third", slot: 5 } },
-  { id: "R32-07", home: { type: "first", group: "K" }, away: { type: "third", slot: 6 } },
-  { id: "R32-08", home: { type: "first", group: "L" }, away: { type: "third", slot: 7 } },
-  { id: "R32-09", home: { type: "first", group: "B" }, away: { type: "first", group: "D" } },
-  { id: "R32-10", home: { type: "first", group: "F" }, away: { type: "first", group: "J" } },
-  { id: "R32-11", home: { type: "second", group: "A" }, away: { type: "second", group: "B" } },
-  { id: "R32-12", home: { type: "second", group: "C" }, away: { type: "second", group: "D" } },
-  { id: "R32-13", home: { type: "second", group: "E" }, away: { type: "second", group: "F" } },
-  { id: "R32-14", home: { type: "second", group: "G" }, away: { type: "second", group: "H" } },
-  { id: "R32-15", home: { type: "second", group: "I" }, away: { type: "second", group: "J" } },
-  { id: "R32-16", home: { type: "second", group: "K" }, away: { type: "second", group: "L" } },
-];
-
-const R16_PAIRS = [
-  ["R32-01", "R32-02"],
-  ["R32-03", "R32-04"],
-  ["R32-05", "R32-06"],
-  ["R32-07", "R32-08"],
-  ["R32-09", "R32-11"],
-  ["R32-10", "R32-12"],
-  ["R32-13", "R32-15"],
-  ["R32-14", "R32-16"],
-];
-
-const STORAGE_KEY = "wc2026-resultados-v1";
+function flagUrl(ptTeamName) {
+  const info = TEAM_INFO[ptTeamName];
+  if (!info) return null;
+  return `https://flagcdn.com/w40/${info.flag}.png`;
+}
 
 /* ---------------------------------------------------------------------- */
 /* LÓGICA DE CLASSIFICAÇÃO                                                */
@@ -131,16 +97,67 @@ function groupHasAllResults(letter, results) {
   });
 }
 
-function resolveSlot(slot, tables, thirds) {
-  if (slot.type === "first") return tables[slot.group][0]?.team ?? null;
-  if (slot.type === "second") return tables[slot.group][1]?.team ?? null;
-  if (slot.type === "third") return thirds[slot.slot]?.team ?? null;
+/* ---------------------------------------------------------------------- */
+/* RESOLUÇÃO DO CHAVEAMENTO ELIMINATÓRIO                                 */
+/* ---------------------------------------------------------------------- */
+
+// Resolve um identificador de slot ("1A", "2B", "3A/B/C/D/F", "W101", "L101")
+// para o nome (em português) da seleção que ocupa aquela posição, dado o
+// estado atual (tabelas de grupo, 8 melhores 3ºs, resultados do mata-mata).
+function resolveKoSlot(code, ctx) {
+  if (!code) return null;
+
+  // 1º ou 2º colocado de um grupo: "1A", "2C", ...
+  const groupPos = code.match(/^([12])([A-L])$/);
+  if (groupPos) {
+    const [, pos, letter] = groupPos;
+    const idx = pos === "1" ? 0 : 1;
+    if (!groupHasAllResults(letter, ctx.results)) return null;
+    return ctx.tables[letter][idx]?.team ?? null;
+  }
+
+  // Melhor 3º colocado entre uma lista de grupos: "3A/B/C/D/F"
+  const thirdPos = code.match(/^3(.+)$/);
+  if (thirdPos) {
+    if (!ctx.allGroupsComplete) return null;
+    const candidateGroups = thirdPos[1].split("/");
+    const found = ctx.bestThirds.find((t) => candidateGroups.includes(t.group));
+    return found ? found.team : null;
+  }
+
+  // Vencedor de uma partida anterior: "W89"
+  const winner = code.match(/^W(\d+)$/);
+  if (winner) {
+    return ctx.winnerOf(Number(winner[1]));
+  }
+
+  // Perdedor de uma partida anterior (usado só na disputa de 3º lugar): "L101"
+  const loser = code.match(/^L(\d+)$/);
+  if (loser) {
+    return ctx.loserOf(Number(loser[1]));
+  }
+
   return null;
 }
 
 /* ---------------------------------------------------------------------- */
 /* COMPONENTES PEQUENOS                                                   */
 /* ---------------------------------------------------------------------- */
+
+function Flag({ team, size = 20 }) {
+  const url = flagUrl(team);
+  if (!url) return <span className="flag-fallback" style={{ width: size }} />;
+  return (
+    <img
+      className="flag-img"
+      src={url}
+      alt=""
+      width={size}
+      height={Math.round(size * 0.75)}
+      loading="lazy"
+    />
+  );
+}
 
 function ScoreInput({ value, onChange, disabled }) {
   return (
@@ -158,23 +175,29 @@ function ScoreInput({ value, onChange, disabled }) {
   );
 }
 
-function GroupFixtureRow({ fx, result, onChange }) {
+function GroupFixtureRow({ fx, result, onChange, isReal }) {
   const home = result?.home ?? "";
   const away = result?.away ?? "";
   return (
-    <div className="fixture-row">
-      <span className="fixture-team home">{fx.home}</span>
+    <div className={`fixture-row ${isReal ? "fixture-real" : ""}`}>
+      <span className="fixture-team home">
+        {fx.home}
+        <Flag team={fx.home} size={16} />
+      </span>
       <div className="fixture-score">
-        <ScoreInput value={home} onChange={(v) => onChange(fx.id, "home", v)} />
+        <ScoreInput value={home} onChange={(v) => onChange(fx.id, "home", v)} disabled={isReal} />
         <span className="fixture-dash">–</span>
-        <ScoreInput value={away} onChange={(v) => onChange(fx.id, "away", v)} />
+        <ScoreInput value={away} onChange={(v) => onChange(fx.id, "away", v)} disabled={isReal} />
       </div>
-      <span className="fixture-team away">{fx.away}</span>
+      <span className="fixture-team away">
+        <Flag team={fx.away} size={16} />
+        {fx.away}
+      </span>
     </div>
   );
 }
 
-function GroupCard({ letter, results, onChangeFixture, qualifiedSet, thirdLabelFor }) {
+function GroupCard({ letter, results, realIds, onChangeFixture, qualifiedSet, thirdLabelFor }) {
   const fixtures = groupFixtures(letter);
   const table = computeGroupTable(letter, results);
   const byRound = [1, 2, 3].map((r) => fixtures.filter((f) => f.round === r));
@@ -182,7 +205,6 @@ function GroupCard({ letter, results, onChangeFixture, qualifiedSet, thirdLabelF
   return (
     <section className="group-card">
       <header className="group-card-header">
-        <span className="group-letter">{letter}</span>
         <span className="group-name">Grupo {letter}</span>
       </header>
 
@@ -205,7 +227,8 @@ function GroupCard({ letter, results, onChangeFixture, qualifiedSet, thirdLabelF
               <tr key={row.team} className={qualified ? "qualified" : isThird ? "maybe" : ""}>
                 <td className="pos-col">{i + 1}</td>
                 <td className="team-col">
-                  {row.team}
+                  <Flag team={row.team} size={18} />
+                  <span>{row.team}</span>
                   {thirdNote ? <span className="third-tag">{thirdNote}</span> : null}
                 </td>
                 <td>{row.pts}</td>
@@ -227,6 +250,7 @@ function GroupCard({ letter, results, onChangeFixture, qualifiedSet, thirdLabelF
                 fx={fx}
                 result={results[fx.id]}
                 onChange={onChangeFixture}
+                isReal={realIds.has(fx.id)}
               />
             ))}
           </div>
@@ -247,392 +271,23 @@ function KOMatchBox({ title, homeTeam, awayTeam, result, onChange, onPenChange, 
     <div className={`ko-box ${ready ? "" : "ko-pending"}`}>
       {title ? <span className="ko-title">{title}</span> : null}
       <div className="ko-row">
+        <Flag team={homeTeam} size={18} />
         <span className="ko-team">{homeTeam ?? "—"}</span>
-        <ScoreInput
-          value={hg}
-          disabled={!ready || locked}
-          onChange={(v) => onChange("home", v)}
-        />
+        <ScoreInput value={hg} disabled={!ready || locked} onChange={(v) => onChange("home", v)} />
       </div>
       <div className="ko-row">
+        <Flag team={awayTeam} size={18} />
         <span className="ko-team">{awayTeam ?? "—"}</span>
-        <ScoreInput
-          value={ag}
-          disabled={!ready || locked}
-          onChange={(v) => onChange("away", v)}
-        />
+        <ScoreInput value={ag} disabled={!ready || locked} onChange={(v) => onChange("away", v)} />
       </div>
       {isDraw && onPenChange ? (
         <div className="ko-pens">
           <span className="ko-pens-label">Pênaltis</span>
-          <ScoreInput
-            value={result?.pen?.home ?? ""}
-            disabled={locked}
-            onChange={(v) => onPenChange("home", v)}
-          />
+          <ScoreInput value={result?.pen?.home ?? ""} disabled={locked} onChange={(v) => onPenChange("home", v)} />
           <span className="fixture-dash">–</span>
-          <ScoreInput
-            value={result?.pen?.away ?? ""}
-            disabled={locked}
-            onChange={(v) => onPenChange("away", v)}
-          />
+          <ScoreInput value={result?.pen?.away ?? ""} disabled={locked} onChange={(v) => onPenChange("away", v)} />
         </div>
       ) : null}
-    </div>
-  );
-}
-
-/* ---------------------------------------------------------------------- */
-/* APP PRINCIPAL                                                          */
-/* ---------------------------------------------------------------------- */
-
-export default function WorldCup2026() {
-  const [results, setResults] = useState({});
-  const [koResults, setKoResults] = useState({});
-  const [loaded, setLoaded] = useState(false);
-  const [toast, setToast] = useState("");
-
-  // Carregar dados salvos
-  useEffect(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        setResults(parsed.results || {});
-        setKoResults(parsed.koResults || {});
-      }
-    } catch (e) {
-      // sem dados salvos ainda
-    } finally {
-      setLoaded(true);
-    }
-  }, []);
-
-  // Salvar a cada mudança (debounced simples)
-  useEffect(() => {
-    if (!loaded) return;
-    const t = setTimeout(() => {
-      try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify({ results, koResults }));
-      } catch (e) {
-        // ignora falha de storage (ex: modo privado sem permissão)
-      }
-    }, 250);
-    return () => clearTimeout(t);
-  }, [results, koResults, loaded]);
-
-  const showToast = useCallback((msg) => {
-    setToast(msg);
-    setTimeout(() => setToast(""), 2200);
-  }, []);
-
-  const handleFixtureChange = useCallback((id, side, value) => {
-    setResults((prev) => ({
-      ...prev,
-      [id]: { ...prev[id], [side]: value },
-    }));
-  }, []);
-
-  const handleKoChange = useCallback((matchId, homeTeam, awayTeam) => (side, value) => {
-    setKoResults((prev) => ({
-      ...prev,
-      [matchId]: {
-        ...prev[matchId],
-        homeTeam,
-        awayTeam,
-        [side]: value,
-      },
-    }));
-  }, []);
-
-  const handleKoPenChange = useCallback((matchId) => (side, value) => {
-    setKoResults((prev) => ({
-      ...prev,
-      [matchId]: {
-        ...prev[matchId],
-        pen: { ...(prev[matchId]?.pen || {}), [side]: value },
-      },
-    }));
-  }, []);
-
-  /* -------- Cálculos derivados -------- */
-
-  const tables = useMemo(() => allGroupTables(results), [results]);
-  const allGroupsComplete = useMemo(
-    () => GROUP_LETTERS.every((l) => groupHasAllResults(l, results)),
-    [results]
-  );
-  const thirds = useMemo(() => bestThirdPlaced(tables), [tables]);
-
-  const qualifiedSet = useMemo(() => {
-    const s = new Set();
-    for (const letter of GROUP_LETTERS) {
-      if (groupHasAllResults(letter, results)) {
-        s.add(tables[letter][0].team);
-        s.add(tables[letter][1].team);
-      }
-    }
-    if (allGroupsComplete) {
-      for (const t of thirds) s.add(t.team);
-    }
-    return s;
-  }, [tables, results, allGroupsComplete, thirds]);
-
-  const thirdLabelFor = useCallback(
-    (letter) => {
-      if (!allGroupsComplete) return null;
-      const idx = thirds.findIndex((t) => t.group === letter);
-      return idx >= 0 ? `${idx + 1}º melhor 3º` : "eliminado";
-    },
-    [thirds, allGroupsComplete]
-  );
-
-  const r32Resolved = useMemo(() => {
-    // Slots "third" só podem ser resolvidos quando todos os 12 grupos
-    // tiverem terminado (precisamos comparar os 12 terceiros entre si).
-    const canResolve = (slot) => slot.type !== "third" || allGroupsComplete;
-    return R32_MATCHES.map((m) => {
-      const homeTeam = canResolve(m.home) ? resolveSlot(m.home, tables, thirds) : null;
-      const awayTeam = canResolve(m.away) ? resolveSlot(m.away, tables, thirds) : null;
-      return { ...m, homeTeam, awayTeam };
-    });
-  }, [tables, thirds, allGroupsComplete]);
-
-  function winnerOf(matchId) {
-    const r = koResults[matchId];
-    if (!r) return null;
-    const hg = Number(r.home), ag = Number(r.away);
-    if (r.home === "" || r.away === "" || Number.isNaN(hg) || Number.isNaN(ag)) return null;
-    if (hg > ag) return r.homeTeam;
-    if (ag > hg) return r.awayTeam;
-    if (r.pen && r.pen.home !== "" && r.pen.away !== "") {
-      const ph = Number(r.pen.home), pa = Number(r.pen.away);
-      if (!Number.isNaN(ph) && !Number.isNaN(pa) && ph !== pa) return ph > pa ? r.homeTeam : r.awayTeam;
-    }
-    return null;
-  }
-
-  const r16Resolved = useMemo(() => {
-    return R16_PAIRS.map(([aId, bId], idx) => {
-      const homeTeam = winnerOf(aId);
-      const awayTeam = winnerOf(bId);
-      return { id: `R16-${idx + 1}`, homeTeam, awayTeam, fromA: aId, fromB: bId };
-    });
-  }, [koResults, r32Resolved]);
-
-  const qfResolved = useMemo(() => {
-    const pairs = [[0, 1], [2, 3], [4, 5], [6, 7]];
-    return pairs.map(([ai, bi], idx) => {
-      const homeTeam = winnerOf(r16Resolved[ai].id);
-      const awayTeam = winnerOf(r16Resolved[bi].id);
-      return { id: `QF-${idx + 1}`, homeTeam, awayTeam };
-    });
-  }, [koResults, r16Resolved]);
-
-  const sfResolved = useMemo(() => {
-    const pairs = [[0, 1], [2, 3]];
-    return pairs.map(([ai, bi], idx) => {
-      const homeTeam = winnerOf(qfResolved[ai].id);
-      const awayTeam = winnerOf(qfResolved[bi].id);
-      return { id: `SF-${idx + 1}`, homeTeam, awayTeam };
-    });
-  }, [koResults, qfResolved]);
-
-  const finalResolved = useMemo(() => {
-    const homeTeam = winnerOf(sfResolved[0].id);
-    const awayTeam = winnerOf(sfResolved[1].id);
-    return { id: "FINAL", homeTeam, awayTeam };
-  }, [koResults, sfResolved]);
-
-  const champion = winnerOf("FINAL");
-
-  /* -------- Ações: simular e resetar -------- */
-
-  function randomScore() {
-    const weights = [0, 0, 0, 1, 1, 1, 1, 2, 2, 3];
-    return weights[Math.floor(Math.random() * weights.length)];
-  }
-
-  function simulateAll() {
-    const newResults = { ...results };
-    for (const letter of GROUP_LETTERS) {
-      for (const fx of groupFixtures(letter)) {
-        const cur = newResults[fx.id];
-        if (!cur || cur.home === "" || cur.home == null || cur.away === "" || cur.away == null) {
-          newResults[fx.id] = { home: String(randomScore()), away: String(randomScore()) };
-        }
-      }
-    }
-    setResults(newResults);
-    showToast("Jogos de grupo em aberto foram simulados ⚽");
-  }
-
-  function simulateKnockoutStep(matches) {
-    setKoResults((prev) => {
-      const next = { ...prev };
-      for (const m of matches) {
-        if (!m.homeTeam || !m.awayTeam) continue;
-        const existing = next[m.id];
-        const hasResult = existing && existing.home !== "" && existing.away !== "" && existing.home != null && existing.away != null;
-        if (hasResult) continue;
-        let hg = randomScore();
-        let ag = randomScore();
-        const entry = { homeTeam: m.homeTeam, awayTeam: m.awayTeam, home: String(hg), away: String(ag) };
-        if (hg === ag) {
-          // Pênaltis: gera dois números distintos entre 3 e 7 para decidir o vencedor
-          const penHome = 3 + Math.floor(Math.random() * 5);
-          let penAway = 3 + Math.floor(Math.random() * 5);
-          if (penAway === penHome) penAway = penHome + 1;
-          entry.pen = { home: String(penHome), away: String(penAway) };
-        }
-        next[m.id] = entry;
-      }
-      return next;
-    });
-  }
-
-  function resetAll() {
-    if (typeof window !== "undefined" && !window.confirm("Tem certeza que deseja apagar todos os resultados?")) return;
-    setResults({});
-    setKoResults({});
-    showToast("Tudo zerado.");
-  }
-
-  /* -------- Render -------- */
-
-  return (
-    <div className="wc-app">
-      <Styles />
-      <header className="app-header">
-        <div className="app-header-inner">
-          <div className="title-block">
-            <span className="eyebrow">FIFA · 11 jun – 19 jul 2026</span>
-            <h1>Copa do Mundo 2026</h1>
-            <span className="subtitle">Canadá · México · Estados Unidos — 48 seleções, 12 grupos</span>
-          </div>
-          <div className="actions">
-            <button className="btn btn-primary" onClick={simulateAll}>
-              Simular jogos de grupo
-            </button>
-            <button className="btn btn-ghost" onClick={resetAll}>
-              Zerar tudo
-            </button>
-          </div>
-        </div>
-      </header>
-
-      {!allGroupsComplete && (
-        <div className="banner">
-          Preencha (ou simule) todos os jogos dos 12 grupos para liberar o chaveamento eliminatório completo.
-        </div>
-      )}
-
-      <div className="layout">
-        <div className="groups-col">
-          {LEFT_GROUPS.map((letter) => (
-            <GroupCard
-              key={letter}
-              letter={letter}
-              results={results}
-              onChangeFixture={handleFixtureChange}
-              qualifiedSet={qualifiedSet}
-              thirdLabelFor={thirdLabelFor}
-            />
-          ))}
-        </div>
-
-        <div className="bracket-col">
-          <BestThirdsPanel thirds={thirds} ready={allGroupsComplete} />
-
-          <BracketRound
-            title="16-avos de final"
-            matches={r32Resolved.map((m) => ({
-              id: m.id,
-              homeTeam: m.homeTeam,
-              awayTeam: m.awayTeam,
-            }))}
-            koResults={koResults}
-            onChange={handleKoChange}
-            onPenChange={handleKoPenChange}
-            onSimulate={() => simulateKnockoutStep(r32Resolved)}
-            simulateLabel="Simular 16-avos"
-            canSimulate={allGroupsComplete}
-          />
-
-          <BracketRound
-            title="Oitavas de final"
-            matches={r16Resolved}
-            koResults={koResults}
-            onChange={handleKoChange}
-            onPenChange={handleKoPenChange}
-            onSimulate={() => simulateKnockoutStep(r16Resolved)}
-            simulateLabel="Simular oitavas"
-            canSimulate={r16Resolved.every((m) => m.homeTeam && m.awayTeam)}
-          />
-
-          <BracketRound
-            title="Quartas de final"
-            matches={qfResolved}
-            koResults={koResults}
-            onChange={handleKoChange}
-            onPenChange={handleKoPenChange}
-            onSimulate={() => simulateKnockoutStep(qfResolved)}
-            simulateLabel="Simular quartas"
-            canSimulate={qfResolved.every((m) => m.homeTeam && m.awayTeam)}
-          />
-
-          <BracketRound
-            title="Semifinais"
-            matches={sfResolved}
-            koResults={koResults}
-            onChange={handleKoChange}
-            onPenChange={handleKoPenChange}
-            onSimulate={() => simulateKnockoutStep(sfResolved)}
-            simulateLabel="Simular semifinais"
-            canSimulate={sfResolved.every((m) => m.homeTeam && m.awayTeam)}
-          />
-
-          <section className="final-section">
-            <h3 className="round-title">Final</h3>
-            <KOMatchBox
-              homeTeam={finalResolved.homeTeam}
-              awayTeam={finalResolved.awayTeam}
-              result={koResults["FINAL"]}
-              onChange={handleKoChange("FINAL", finalResolved.homeTeam, finalResolved.awayTeam)}
-              onPenChange={handleKoPenChange("FINAL")}
-            />
-            {finalResolved.homeTeam && finalResolved.awayTeam && (
-              <button
-                className="btn btn-primary btn-small"
-                onClick={() => simulateKnockoutStep([finalResolved])}
-              >
-                Simular final
-              </button>
-            )}
-            {champion && (
-              <div className="champion-card">
-                <span className="champion-label">Campeã da Copa do Mundo 2026</span>
-                <span className="champion-name">{champion}</span>
-              </div>
-            )}
-          </section>
-        </div>
-
-        <div className="groups-col">
-          {RIGHT_GROUPS.map((letter) => (
-            <GroupCard
-              key={letter}
-              letter={letter}
-              results={results}
-              onChangeFixture={handleFixtureChange}
-              qualifiedSet={qualifiedSet}
-              thirdLabelFor={thirdLabelFor}
-            />
-          ))}
-        </div>
-      </div>
-
-      {toast && <div className="toast">{toast}</div>}
     </div>
   );
 }
@@ -647,9 +302,13 @@ function BestThirdsPanel({ thirds, ready }) {
         <ol className="thirds-list">
           {thirds.map((t) => (
             <li key={t.group}>
-              <span className="thirds-team">{t.team}</span>
-              <span className="thirds-group">Grupo {t.group}</span>
-              <span className="thirds-pts">{t.pts} pts · SG {t.sg > 0 ? `+${t.sg}` : t.sg}</span>
+              <Flag team={t.team} size={16} />
+              <div className="thirds-text">
+                <span className="thirds-team">{t.team}</span>
+                <span className="thirds-group">
+                  Grupo {t.group} · {t.pts} pts · SG {t.sg > 0 ? `+${t.sg}` : t.sg}
+                </span>
+              </div>
             </li>
           ))}
         </ol>
@@ -686,28 +345,446 @@ function BracketRound({ title, matches, koResults, onChange, onPenChange, onSimu
 }
 
 /* ---------------------------------------------------------------------- */
-/* ESTILOS                                                                */
+/* APP PRINCIPAL                                                          */
+/* ---------------------------------------------------------------------- */
+
+export default function WorldCup2026() {
+  const [results, setResults] = useState({});
+  const [koResults, setKoResults] = useState({});
+  const [realIds, setRealIds] = useState(new Set());
+  const [loaded, setLoaded] = useState(false);
+  const [toast, setToast] = useState("");
+  const [syncState, setSyncState] = useState("idle"); // idle | loading | ok | error
+  const [lastSync, setLastSync] = useState(null);
+  const refreshTimer = useRef(null);
+
+  /* ---- Persistência local (localStorage) ---- */
+
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        setResults(parsed.results || {});
+        setKoResults(parsed.koResults || {});
+      }
+    } catch (e) {
+      // sem dados salvos ainda
+    } finally {
+      setLoaded(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!loaded) return;
+    const t = setTimeout(() => {
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify({ results, koResults }));
+      } catch (e) {
+        // ignora falha de storage
+      }
+    }, 250);
+    return () => clearTimeout(t);
+  }, [results, koResults, loaded]);
+
+  /* ---- Busca de resultados reais (com fallback) ---- */
+
+  const syncRemote = useCallback(async () => {
+    setSyncState("loading");
+    const remote = await fetchRemoteResults(groupFixtures);
+    if (!remote) {
+      setSyncState("error");
+      return;
+    }
+    const ids = new Set(Object.keys(remote));
+    setRealIds(ids);
+    setResults((prev) => {
+      const merged = { ...prev };
+      for (const id of ids) merged[id] = remote[id];
+      return merged;
+    });
+    setSyncState("ok");
+    setLastSync(new Date());
+    try {
+      localStorage.setItem(
+        REMOTE_CACHE_KEY,
+        JSON.stringify({ data: remote, ids: Array.from(ids), at: Date.now() })
+      );
+    } catch (e) {
+      // cache best-effort
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!loaded) return;
+
+    // 1) tenta usar um cache local recente para já mostrar algo rápido
+    try {
+      const cached = localStorage.getItem(REMOTE_CACHE_KEY);
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        if (parsed && parsed.data && Date.now() - parsed.at < 24 * 60 * 60 * 1000) {
+          setRealIds(new Set(parsed.ids || []));
+          setResults((prev) => ({ ...prev, ...parsed.data }));
+        }
+      }
+    } catch (e) {
+      // ignora cache inválido
+    }
+
+    // 2) busca os dados reais mais recentes
+    syncRemote();
+
+    // 3) atualiza periodicamente
+    refreshTimer.current = setInterval(syncRemote, REMOTE_REFRESH_MS);
+    return () => clearInterval(refreshTimer.current);
+  }, [loaded, syncRemote]);
+
+  const showToast = useCallback((msg) => {
+    setToast(msg);
+    setTimeout(() => setToast(""), 2200);
+  }, []);
+
+  const handleFixtureChange = useCallback((id, side, value) => {
+    setResults((prev) => ({ ...prev, [id]: { ...prev[id], [side]: value } }));
+  }, []);
+
+  const handleKoChange = useCallback(
+    (matchId, homeTeam, awayTeam) => (side, value) => {
+      setKoResults((prev) => ({
+        ...prev,
+        [matchId]: { ...prev[matchId], homeTeam, awayTeam, [side]: value },
+      }));
+    },
+    []
+  );
+
+  const handleKoPenChange = useCallback(
+    (matchId) => (side, value) => {
+      setKoResults((prev) => ({
+        ...prev,
+        [matchId]: { ...prev[matchId], pen: { ...(prev[matchId]?.pen || {}), [side]: value } },
+      }));
+    },
+    []
+  );
+
+  /* -------- Cálculos derivados -------- */
+
+  const tables = useMemo(() => allGroupTables(results), [results]);
+  const allGroupsComplete = useMemo(
+    () => GROUP_LETTERS.every((l) => groupHasAllResults(l, results)),
+    [results]
+  );
+  const bestThirds = useMemo(() => bestThirdPlaced(tables), [tables]);
+
+  const qualifiedSet = useMemo(() => {
+    const s = new Set();
+    for (const letter of GROUP_LETTERS) {
+      if (groupHasAllResults(letter, results)) {
+        s.add(tables[letter][0].team);
+        s.add(tables[letter][1].team);
+      }
+    }
+    if (allGroupsComplete) for (const t of bestThirds) s.add(t.team);
+    return s;
+  }, [tables, results, allGroupsComplete, bestThirds]);
+
+  const thirdLabelFor = useCallback(
+    (letter) => {
+      if (!allGroupsComplete) return null;
+      const idx = bestThirds.findIndex((t) => t.group === letter);
+      return idx >= 0 ? `${idx + 1}º melhor 3º` : "eliminado";
+    },
+    [bestThirds, allGroupsComplete]
+  );
+
+  function winnerOf(num) {
+    const r = koResults[num];
+    if (!r) return null;
+    const hg = Number(r.home), ag = Number(r.away);
+    if (r.home === "" || r.away === "" || Number.isNaN(hg) || Number.isNaN(ag)) return null;
+    if (hg > ag) return r.homeTeam;
+    if (ag > hg) return r.awayTeam;
+    if (r.pen && r.pen.home !== "" && r.pen.away !== "") {
+      const ph = Number(r.pen.home), pa = Number(r.pen.away);
+      if (!Number.isNaN(ph) && !Number.isNaN(pa) && ph !== pa) return ph > pa ? r.homeTeam : r.awayTeam;
+    }
+    return null;
+  }
+
+  function loserOf(num) {
+    const r = koResults[num];
+    if (!r || !r.homeTeam || !r.awayTeam) return null;
+    const w = winnerOf(num);
+    if (!w) return null;
+    return w === r.homeTeam ? r.awayTeam : r.homeTeam;
+  }
+
+  const koCtx = { results, tables, allGroupsComplete, bestThirds, winnerOf, loserOf };
+
+  const koResolved = useMemo(() => {
+    return KNOCKOUT_MATCHES.map((m) => ({
+      ...m,
+      id: String(m.num),
+      homeTeam: resolveKoSlot(m.team1, koCtx),
+      awayTeam: resolveKoSlot(m.team2, koCtx),
+    }));
+  }, [tables, allGroupsComplete, bestThirds, koResults]);
+
+  const champion = winnerOf(104);
+
+  /* -------- Ações: simular e resetar -------- */
+
+  function randomScore() {
+    const weights = [0, 0, 0, 1, 1, 1, 1, 2, 2, 3];
+    return weights[Math.floor(Math.random() * weights.length)];
+  }
+
+  function simulateGroupStage() {
+    const newResults = { ...results };
+    for (const letter of GROUP_LETTERS) {
+      for (const fx of groupFixtures(letter)) {
+        if (realIds.has(fx.id)) continue; // nunca sobrescreve resultado real
+        const cur = newResults[fx.id];
+        if (!cur || cur.home === "" || cur.home == null || cur.away === "" || cur.away == null) {
+          newResults[fx.id] = { home: String(randomScore()), away: String(randomScore()) };
+        }
+      }
+    }
+    setResults(newResults);
+    showToast("Jogos de grupo em aberto foram simulados ⚽");
+  }
+
+  function simulateKnockoutStep(matches) {
+    setKoResults((prev) => {
+      const next = { ...prev };
+      for (const m of matches) {
+        if (!m.homeTeam || !m.awayTeam) continue;
+        const existing = next[m.id];
+        const hasResult = existing && existing.home !== "" && existing.away !== "" && existing.home != null && existing.away != null;
+        if (hasResult) continue;
+        const hg = randomScore();
+        const ag = randomScore();
+        const entry = { homeTeam: m.homeTeam, awayTeam: m.awayTeam, home: String(hg), away: String(ag) };
+        if (hg === ag) {
+          const penHome = 3 + Math.floor(Math.random() * 5);
+          let penAway = 3 + Math.floor(Math.random() * 5);
+          if (penAway === penHome) penAway = penHome + 1;
+          entry.pen = { home: String(penHome), away: String(penAway) };
+        }
+        next[m.id] = entry;
+      }
+      return next;
+    });
+  }
+
+  function resetManualData() {
+    if (typeof window !== "undefined" && !window.confirm("Isso apaga apenas os resultados que você preencheu/simulou manualmente (os reais continuam). Confirmar?")) return;
+    setResults((prev) => {
+      const kept = {};
+      for (const id of realIds) if (prev[id]) kept[id] = prev[id];
+      return kept;
+    });
+    setKoResults({});
+    showToast("Resultados manuais zerados.");
+  }
+
+  /* -------- Agrupamento do chaveamento por rodada -------- */
+
+  const koByRound = useMemo(() => {
+    const out = {};
+    for (const round of KO_ROUND_ORDER) out[round] = koResolved.filter((m) => m.round === round);
+    return out;
+  }, [koResolved]);
+
+  /* -------- Render -------- */
+
+  return (
+    <div className="wc-app">
+      <Styles />
+      <header className="app-header">
+        <div className="app-header-inner">
+          <div className="title-block">
+            <h1>
+              FIFA WORLD CUP 2026 <span className="title-accent">FASE DE GRUPOS</span>
+            </h1>
+            <SyncStatus syncState={syncState} lastSync={lastSync} onRetry={syncRemote} />
+          </div>
+          <div className="actions">
+            <button className="btn btn-primary" onClick={simulateGroupStage}>
+              Simular jogos restantes
+            </button>
+            <button className="btn btn-ghost" onClick={resetManualData}>
+              Zerar simulação
+            </button>
+          </div>
+        </div>
+      </header>
+
+      {!allGroupsComplete && (
+        <div className="banner">
+          Os resultados reais já disputados são buscados automaticamente. Preencha ou simule o restante para liberar o chaveamento completo.
+        </div>
+      )}
+
+      <div className="layout">
+        <div className="groups-col">
+          {LEFT_GROUPS.map((letter) => (
+            <GroupCard
+              key={letter}
+              letter={letter}
+              results={results}
+              realIds={realIds}
+              onChangeFixture={handleFixtureChange}
+              qualifiedSet={qualifiedSet}
+              thirdLabelFor={thirdLabelFor}
+            />
+          ))}
+        </div>
+
+        <div className="bracket-col">
+          <BestThirdsPanel thirds={bestThirds} ready={allGroupsComplete} />
+
+          {KO_ROUND_ORDER.filter((r) => r !== "Disputa de 3º lugar" && r !== "Final").map((round) => (
+            <BracketRound
+              key={round}
+              title={round}
+              matches={koByRound[round]}
+              koResults={koResults}
+              onChange={handleKoChange}
+              onPenChange={handleKoPenChange}
+              onSimulate={() => simulateKnockoutStep(koByRound[round])}
+              simulateLabel={`Simular ${round.toLowerCase()}`}
+              canSimulate={koByRound[round].every((m) => m.homeTeam && m.awayTeam)}
+            />
+          ))}
+
+          <section className="final-section">
+            <h3 className="round-title">Final &amp; disputa de 3º lugar</h3>
+            <div className="bracket-grid">
+              {koByRound["Disputa de 3º lugar"].map((m) => (
+                <KOMatchBox
+                  key={m.id}
+                  title="3º lugar"
+                  homeTeam={m.homeTeam}
+                  awayTeam={m.awayTeam}
+                  result={koResults[m.id]}
+                  onChange={handleKoChange(m.id, m.homeTeam, m.awayTeam)}
+                  onPenChange={handleKoPenChange(m.id)}
+                />
+              ))}
+              {koByRound["Final"].map((m) => (
+                <KOMatchBox
+                  key={m.id}
+                  title="Final"
+                  homeTeam={m.homeTeam}
+                  awayTeam={m.awayTeam}
+                  result={koResults[m.id]}
+                  onChange={handleKoChange(m.id, m.homeTeam, m.awayTeam)}
+                  onPenChange={handleKoPenChange(m.id)}
+                />
+              ))}
+            </div>
+            {koByRound["Final"][0]?.homeTeam && koByRound["Final"][0]?.awayTeam && (
+              <button
+                className="btn btn-primary btn-small"
+                onClick={() => simulateKnockoutStep([...koByRound["Disputa de 3º lugar"], ...koByRound["Final"]])}
+              >
+                Simular final
+              </button>
+            )}
+            {champion && (
+              <div className="champion-card">
+                <Flag team={champion} size={28} />
+                <div>
+                  <span className="champion-label">Campeã da Copa do Mundo 2026</span>
+                  <span className="champion-name">{champion}</span>
+                </div>
+              </div>
+            )}
+          </section>
+        </div>
+
+        <div className="groups-col">
+          {RIGHT_GROUPS.map((letter) => (
+            <GroupCard
+              key={letter}
+              letter={letter}
+              results={results}
+              realIds={realIds}
+              onChangeFixture={handleFixtureChange}
+              qualifiedSet={qualifiedSet}
+              thirdLabelFor={thirdLabelFor}
+            />
+          ))}
+        </div>
+      </div>
+
+      {toast && <div className="toast">{toast}</div>}
+
+      <footer className="app-footer">
+        Dados reais via{" "}
+        <a href="https://github.com/openfootball/worldcup.json" target="_blank" rel="noreferrer">
+          openfootball/worldcup.json
+        </a>{" "}
+        (domínio público). Projeto não-oficial, sem afiliação com a FIFA.
+      </footer>
+    </div>
+  );
+}
+
+function SyncStatus({ syncState, lastSync, onRetry }) {
+  if (syncState === "loading") {
+    return <span className="sync-status sync-loading">Buscando resultados reais…</span>;
+  }
+  if (syncState === "ok") {
+    const time = lastSync
+      ? lastSync.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })
+      : "";
+    return <span className="sync-status sync-ok">Resultados reais atualizados às {time}</span>;
+  }
+  if (syncState === "error") {
+    return (
+      <span className="sync-status sync-error">
+        Não foi possível buscar os resultados reais agora — usando dados salvos.{" "}
+        <button className="sync-retry" onClick={onRetry}>
+          Tentar de novo
+        </button>
+      </span>
+    );
+  }
+  return null;
+}
+
+/* ---------------------------------------------------------------------- */
+/* ESTILOS — inspirado em gráficos oficiais FIFA (fundo marinho, caixas    */
+/* azul-petróleo nos cabeçalhos, bandeiras ao lado dos nomes)              */
 /* ---------------------------------------------------------------------- */
 
 function Styles() {
   return (
     <style>{`
       :root {
-        --bg: #0d1b2a;
-        --panel: #14283d;
-        --panel-2: #1b3552;
-        --line: #2a4a6b;
-        --text: #eaf2fb;
-        --text-dim: #93acc7;
-        --accent: #ffb703;
-        --accent-2: #2ec4b6;
-        --win: #1f6f4b;
+        --bg: #0a1126;
+        --bg-2: #0d1730;
+        --panel: #101d3d;
+        --panel-2: #16264a;
+        --header-box: #1b3360;
+        --line: #28406e;
+        --text: #f3f6fc;
+        --text-dim: #8fa3c7;
+        --accent: #8b7cf6;
+        --accent-2: #ffffff;
+        --gold: #f0b429;
+        --win: #2ecf8a;
       }
 
       * { box-sizing: border-box; }
 
       .wc-app {
-        background: radial-gradient(circle at 10% 0%, #163149 0%, var(--bg) 55%);
+        background: var(--bg);
+        background-image: radial-gradient(circle at 50% 0%, #122152 0%, var(--bg) 60%);
         color: var(--text);
         font-family: 'Inter', system-ui, -apple-system, Segoe UI, sans-serif;
         min-height: 100vh;
@@ -719,11 +796,11 @@ function Styles() {
         position: sticky;
         top: 0;
         z-index: 20;
-        background: rgba(13, 27, 42, 0.92);
+        background: rgba(10, 17, 38, 0.94);
         backdrop-filter: blur(6px);
       }
       .app-header-inner {
-        max-width: 1500px;
+        max-width: 1560px;
         margin: 0 auto;
         padding: 18px 24px;
         display: flex;
@@ -732,20 +809,24 @@ function Styles() {
         align-items: center;
         justify-content: space-between;
       }
-      .eyebrow {
-        font-size: 12px;
-        letter-spacing: 0.12em;
+      .title-block h1 {
+        margin: 0;
+        font-size: 22px;
+        font-weight: 800;
+        letter-spacing: 0.01em;
         text-transform: uppercase;
         color: var(--accent-2);
-        font-weight: 600;
       }
-      .title-block h1 {
-        margin: 2px 0 2px;
-        font-size: 28px;
-        font-weight: 800;
-        letter-spacing: -0.01em;
+      .title-accent { color: var(--accent); }
+      .sync-status { display: block; margin-top: 6px; font-size: 12px; color: var(--text-dim); }
+      .sync-ok::before { content: "● "; color: var(--win); }
+      .sync-loading::before { content: "● "; color: var(--gold); }
+      .sync-error::before { content: "● "; color: #e85d5d; }
+      .sync-retry {
+        background: none; border: none; color: var(--accent); text-decoration: underline;
+        cursor: pointer; font-size: 12px; padding: 0; margin-left: 4px;
       }
-      .subtitle { color: var(--text-dim); font-size: 13px; }
+
       .actions { display: flex; gap: 10px; flex-wrap: wrap; }
 
       .btn {
@@ -760,24 +841,24 @@ function Styles() {
         transition: transform 0.08s ease, background 0.15s ease;
       }
       .btn:hover { transform: translateY(-1px); }
-      .btn:focus-visible { outline: 2px solid var(--accent-2); outline-offset: 2px; }
-      .btn-primary { background: var(--accent); color: #1a1300; border-color: var(--accent); }
+      .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .btn-primary { background: var(--accent); color: #ffffff; border-color: var(--accent); }
       .btn-ghost { background: transparent; }
-      .btn-small { padding: 6px 10px; font-size: 12px; }
+      .btn-small { padding: 6px 10px; font-size: 12px; align-self: flex-start; }
 
       .banner {
-        max-width: 1500px;
+        max-width: 1560px;
         margin: 14px auto 0;
         padding: 10px 24px;
-        background: #2b2410;
-        border: 1px solid #5a4a18;
-        color: #ffd773;
+        background: #20264a;
+        border: 1px solid var(--accent);
+        color: #cfd3ff;
         font-size: 13px;
         border-radius: 8px;
       }
 
       .layout {
-        max-width: 1500px;
+        max-width: 1560px;
         margin: 20px auto 0;
         padding: 0 24px;
         display: grid;
@@ -786,54 +867,56 @@ function Styles() {
         align-items: start;
       }
 
-      .groups-col {
-        display: flex;
-        flex-direction: column;
-        gap: 16px;
-      }
+      .groups-col { display: flex; flex-direction: column; gap: 16px; }
 
       .group-card {
         background: var(--panel);
         border: 1px solid var(--line);
-        border-radius: 12px;
-        padding: 14px;
+        border-radius: 10px;
+        padding: 0 0 12px;
+        overflow: hidden;
       }
       .group-card-header {
-        display: flex;
-        align-items: baseline;
-        gap: 8px;
-        margin-bottom: 10px;
+        background: var(--header-box);
+        padding: 9px 14px;
+        text-align: center;
+        border-bottom: 1px solid var(--line);
       }
-      .group-letter {
-        font-size: 20px;
+      .group-name {
+        font-size: 13px;
         font-weight: 800;
-        color: var(--accent);
-        font-family: Georgia, serif;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+        color: var(--accent-2);
       }
-      .group-name { font-size: 12px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.06em; }
 
-      .standings { width: 100%; border-collapse: collapse; font-size: 12px; margin-bottom: 10px; }
-      .standings th { text-align: left; color: var(--text-dim); font-weight: 600; padding: 4px 4px; border-bottom: 1px solid var(--line); }
-      .standings td { padding: 5px 4px; border-bottom: 1px solid rgba(255,255,255,0.04); }
+      .standings { width: 100%; border-collapse: collapse; font-size: 12px; margin: 10px 0; padding: 0 12px; }
+      .standings th { text-align: left; color: var(--text-dim); font-weight: 600; padding: 4px 10px; border-bottom: 1px solid var(--line); }
+      .standings td { padding: 6px 10px; border-bottom: 1px solid rgba(255,255,255,0.04); }
       .standings th:not(.team-col), .standings td:not(.team-col) { text-align: center; }
       .pos-col { width: 18px; color: var(--text-dim); }
-      .team-col { font-weight: 600; }
-      tr.qualified .team-col { color: var(--accent-2); }
-      tr.qualified { background: rgba(46, 196, 182, 0.08); }
-      tr.maybe .team-col { color: var(--accent); }
+      .team-col { font-weight: 600; display: flex; align-items: center; gap: 6px; }
+      td.team-col { display: flex; align-items: center; gap: 6px; }
+      tr.qualified .team-col { color: var(--win); }
+      tr.qualified { background: rgba(46, 207, 138, 0.07); }
+      tr.maybe .team-col { color: var(--gold); }
       .third-tag {
         display: inline-block;
-        margin-left: 6px;
-        font-size: 9px;
+        margin-left: 4px;
+        font-size: 8px;
         font-weight: 700;
         text-transform: uppercase;
-        color: var(--accent);
-        border: 1px solid var(--accent);
+        color: var(--gold);
+        border: 1px solid var(--gold);
         border-radius: 999px;
-        padding: 1px 6px;
+        padding: 1px 5px;
+        white-space: nowrap;
       }
 
-      .fixtures { display: flex; flex-direction: column; gap: 8px; }
+      .flag-img { border-radius: 2px; display: inline-block; object-fit: cover; flex-shrink: 0; }
+      .flag-fallback { display: inline-block; height: 14px; background: var(--line); border-radius: 2px; flex-shrink: 0; }
+
+      .fixtures { display: flex; flex-direction: column; gap: 8px; padding: 0 12px; }
       .round-block { display: flex; flex-direction: column; gap: 4px; }
       .round-label {
         font-size: 10px;
@@ -850,13 +933,15 @@ function Styles() {
         font-size: 12px;
         padding: 3px 0;
       }
-      .fixture-team.home { text-align: right; }
-      .fixture-team.away { text-align: left; }
+      .fixture-row.fixture-real { background: rgba(255, 255, 255, 0.03); border-radius: 4px; }
+      .fixture-team { display: flex; align-items: center; gap: 5px; }
+      .fixture-team.home { justify-content: flex-end; text-align: right; }
+      .fixture-team.away { justify-content: flex-start; text-align: left; }
       .fixture-score { display: flex; align-items: center; gap: 4px; justify-content: center; }
       .fixture-dash { color: var(--text-dim); }
 
       .score-input {
-        width: 32px;
+        width: 30px;
         background: var(--panel-2);
         border: 1px solid var(--line);
         color: var(--text);
@@ -868,68 +953,81 @@ function Styles() {
       }
       .score-input::-webkit-outer-spin-button,
       .score-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
-      .score-input:focus-visible { outline: 2px solid var(--accent-2); }
-      .score-input:disabled { opacity: 0.4; }
+      .score-input:focus-visible { outline: 2px solid var(--accent); }
+      .score-input:disabled { opacity: 0.55; }
 
-      .bracket-col { display: flex; flex-direction: column; gap: 18px; }
+      .bracket-col { display: flex; flex-direction: column; gap: 16px; }
 
       .thirds-panel, .bracket-round, .final-section {
         background: var(--panel);
         border: 1px solid var(--line);
-        border-radius: 12px;
-        padding: 14px;
+        border-radius: 10px;
+        padding: 0 0 14px;
+        overflow: hidden;
       }
-      .round-title { margin: 0 0 10px; font-size: 14px; font-weight: 700; letter-spacing: 0.01em; }
-      .bracket-round-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 4px;}
-      .bracket-round-header .round-title { margin-bottom: 0; }
+      .round-title {
+        margin: 0;
+        font-size: 13px;
+        font-weight: 800;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        color: var(--accent-2);
+        background: var(--header-box);
+        padding: 9px 14px;
+      }
+      .bracket-round-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; background: var(--header-box); padding-right: 10px; }
+      .bracket-round-header .round-title { flex: 1; }
+      .bracket-round-header .btn-small { margin: 0; }
 
-      .thirds-empty { color: var(--text-dim); font-size: 12px; margin: 0; }
-      .thirds-list { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; }
+      .thirds-empty { color: var(--text-dim); font-size: 12px; margin: 10px 14px 0; }
+      .thirds-list { list-style: none; margin: 10px 0 0; padding: 0 12px; display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; }
       .thirds-list li {
-        display: flex; flex-direction: column; gap: 1px;
+        display: flex; align-items: center; gap: 6px;
         background: var(--panel-2); border-radius: 8px; padding: 6px 8px; font-size: 11px;
       }
+      .thirds-text { display: flex; flex-direction: column; gap: 1px; }
       .thirds-team { font-weight: 700; font-size: 12px; }
-      .thirds-group { color: var(--text-dim); }
-      .thirds-pts { color: var(--accent-2); }
+      .thirds-group { color: var(--text-dim); font-size: 10px; }
 
       .bracket-grid {
         display: grid;
         grid-template-columns: repeat(2, 1fr);
         gap: 10px;
+        padding: 10px 12px 0;
       }
 
       .ko-box {
         background: var(--panel-2);
         border: 1px solid var(--line);
-        border-radius: 10px;
+        border-radius: 8px;
         padding: 8px 10px;
         display: flex;
         flex-direction: column;
         gap: 4px;
       }
-      .ko-box.ko-pending { opacity: 0.55; }
+      .ko-box.ko-pending { opacity: 0.5; }
       .ko-title { font-size: 10px; color: var(--text-dim); text-transform: uppercase; }
-      .ko-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 13px; font-weight: 600; }
+      .ko-row { display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 600; }
       .ko-team { flex: 1; }
       .ko-pens { display: flex; align-items: center; gap: 4px; margin-top: 4px; font-size: 11px; color: var(--text-dim); }
       .ko-pens-label { margin-right: 4px; }
 
       .final-section { display: flex; flex-direction: column; gap: 10px; align-items: stretch; }
-      .final-section .ko-box { max-width: 320px; }
+      .final-section .btn-small { margin: 0 12px; }
 
       .champion-card {
-        margin-top: 6px;
-        background: linear-gradient(135deg, var(--accent), #ffd773);
-        color: #1a1300;
+        margin: 0 12px 4px;
+        background: linear-gradient(135deg, var(--gold), #ffe39c);
+        color: #2a1d00;
         border-radius: 10px;
-        padding: 14px;
+        padding: 12px 14px;
         display: flex;
-        flex-direction: column;
-        gap: 2px;
+        align-items: center;
+        gap: 10px;
       }
-      .champion-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; font-weight: 700; }
-      .champion-name { font-size: 22px; font-weight: 800; }
+      .champion-card > div { display: flex; flex-direction: column; gap: 1px; }
+      .champion-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; font-weight: 700; }
+      .champion-name { font-size: 18px; font-weight: 800; }
 
       .toast {
         position: fixed;
@@ -937,7 +1035,7 @@ function Styles() {
         left: 50%;
         transform: translateX(-50%);
         background: var(--panel-2);
-        border: 1px solid var(--accent-2);
+        border: 1px solid var(--accent);
         color: var(--text);
         padding: 10px 18px;
         border-radius: 999px;
@@ -945,6 +1043,16 @@ function Styles() {
         box-shadow: 0 8px 24px rgba(0,0,0,0.4);
         z-index: 50;
       }
+
+      .app-footer {
+        max-width: 1560px;
+        margin: 28px auto 0;
+        padding: 0 24px;
+        font-size: 11px;
+        color: var(--text-dim);
+        text-align: center;
+      }
+      .app-footer a { color: var(--accent); text-decoration: underline; }
 
       @media (max-width: 1180px) {
         .layout { grid-template-columns: 1fr; }
